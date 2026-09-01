@@ -1,9 +1,11 @@
-/* 这个脚本写于2026.8.28，若有失效大概是RSA公钥的问题，自己抓一下就好了 */
+/* 这个脚本写于2026.8.28，若有失效大概是RSA公钥的问题，自己抓一下就好了
+author : Skowosy(ZHT0711)*/
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <windows.h>
+#include <wlanapi.h>
 #include <curl/curl.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
@@ -12,6 +14,7 @@
 /* 配置文件信息 */
 #define CONFIG_FILE "config.ini"
 #define MAX_LINE_LEN 256
+#define CONNECTIVITY_URL "https://www.baidu.com/"
 
 /* 登录页 login_neu.js（v=20260302）使用的 RSA 公钥 */
 #define LOGIN_PUBLIC_KEY \
@@ -29,6 +32,7 @@ struct MemoryStruct {
 static void init_memory(struct MemoryStruct *chunk) {
     chunk->memory = malloc(1);
     chunk->size = 0;
+    if (chunk->memory) chunk->memory[0] = '\0';
 }
 
 /* libcurl写回调函数 */
@@ -53,6 +57,93 @@ static void free_memory(struct MemoryStruct *chunk) {
     free(chunk->memory);
     chunk->memory = NULL;
     chunk->size = 0;
+}
+
+static int is_target_ssid(const DOT11_SSID *ssid) {
+    static const char *target_ssids[] = {"NEU", "NEU-2.4G", "NEU-mobile"};
+
+    for (size_t i = 0; i < sizeof(target_ssids) / sizeof(target_ssids[0]); i++) {
+        size_t target_len = strlen(target_ssids[i]);
+        if (ssid->uSSIDLength == target_len &&
+            memcmp(ssid->ucSSID, target_ssids[i], target_len) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* 返回 1 表示连接到目标校园网，0 表示不是，-1 表示 WLAN API 调用失败。 */
+static int get_target_ssid(char *ssid_text, size_t text_size) {
+    HANDLE client = NULL;
+    PWLAN_INTERFACE_INFO_LIST interfaces = NULL;
+    DWORD negotiated_version = 0;
+    DWORD result = WlanOpenHandle(2, NULL, &negotiated_version, &client);
+    int matched = 0;
+
+    if (result != ERROR_SUCCESS) return -1;
+    result = WlanEnumInterfaces(client, NULL, &interfaces);
+    if (result != ERROR_SUCCESS) {
+        WlanCloseHandle(client, NULL);
+        return -1;
+    }
+
+    for (DWORD i = 0; i < interfaces->dwNumberOfItems; i++) {
+        WLAN_INTERFACE_INFO *interface_info = &interfaces->InterfaceInfo[i];
+        PWLAN_CONNECTION_ATTRIBUTES connection = NULL;
+        DWORD connection_size = 0;
+        WLAN_OPCODE_VALUE_TYPE opcode_type;
+
+        if (interface_info->isState != wlan_interface_state_connected) continue;
+        result = WlanQueryInterface(client, &interface_info->InterfaceGuid,
+                                    wlan_intf_opcode_current_connection, NULL,
+                                    &connection_size, (PVOID *)&connection, &opcode_type);
+        if (result != ERROR_SUCCESS || !connection) continue;
+
+        const DOT11_SSID *ssid = &connection->wlanAssociationAttributes.dot11Ssid;
+        if (is_target_ssid(ssid)) {
+            size_t copy_len = ssid->uSSIDLength;
+            if (copy_len >= text_size) copy_len = text_size - 1;
+            memcpy(ssid_text, ssid->ucSSID, copy_len);
+            ssid_text[copy_len] = '\0';
+            matched = 1;
+            WlanFreeMemory(connection);
+            break;
+        }
+        WlanFreeMemory(connection);
+    }
+
+    WlanFreeMemory(interfaces);
+    WlanCloseHandle(client, NULL);
+    return matched;
+}
+
+/* 只发一个短超时的 HTTPS HEAD 请求，避免已经联网时重复认证。 */
+static int internet_is_available(void) {
+    CURL *curl = curl_easy_init();
+    CURLcode result;
+    long status_code = 0;
+
+    if (!curl) return 0;
+    curl_easy_setopt(curl, CURLOPT_URL, CONNECTIVITY_URL);
+    curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 3L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 3000L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 5000L);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "Mozilla/5.0 NEU-AutoLogin/1.0");
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+
+    result = curl_easy_perform(curl);
+    if (result == CURLE_OK) {
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status_code);
+    }
+    curl_easy_cleanup(curl);
+    return result == CURLE_OK && status_code >= 200 && status_code < 400;
+}
+
+static void pause_if_interactive(int scheduled) {
+    if (!scheduled) system("pause");
 }
 
 /* 按网页端 JSEncrypt 的方式，用 RSA/PKCS#1 v1.5 加密“学号+密码”并输出 Base64 */
@@ -148,23 +239,27 @@ static char *extract_execution(const char *html) {
 }
 
 /* 获取 exe 所在目录，并拼接配置文件名 */
-static void get_config_path(char *out_path, size_t out_size) {
-    char exe_path[MAX_PATH];
-    GetModuleFileName(NULL, exe_path, MAX_PATH);
+static int get_config_path(char *out_path, size_t out_size) {
+    DWORD path_len = GetModuleFileNameA(NULL, out_path, (DWORD)out_size);
+    if (path_len == 0 || path_len >= out_size) return -1;
 
-    // 找到最后一个反斜杠，截断为目录
-    char *last_slash = strrchr(exe_path, '\\');
-    if (last_slash != NULL) {
-        *(last_slash + 1) = '\0';
-    }
+    char *last_slash = strrchr(out_path, '\\');
+    if (!last_slash) return -1;
 
-    snprintf(out_path, out_size, "%s%s", exe_path, CONFIG_FILE);
+    size_t directory_len = (size_t)(last_slash - out_path) + 1;
+    size_t config_len = strlen(CONFIG_FILE);
+    if (directory_len + config_len + 1 > out_size) return -1;
+    memcpy(out_path + directory_len, CONFIG_FILE, config_len + 1);
+    return 0;
 }
 
 /* 读取配置文件，获取学号和密码 */
 static int read_config(char *student_id, size_t id_size, char *password, size_t pw_size) {
     char config_path[MAX_PATH];
-    get_config_path(config_path, sizeof(config_path));
+    if (get_config_path(config_path, sizeof(config_path)) != 0) {
+        fprintf(stderr, "无法确定配置文件路径\n");
+        return -1;
+    }
 
     FILE *fp = fopen(config_path, "r");
     if (!fp) {
@@ -333,7 +428,7 @@ static int login_with_acid(CURL *curl, const char *student_id, const char *passw
     curl_easy_setopt(curl, CURLOPT_URL, url);
     curl_easy_setopt(curl, CURLOPT_POST, 1L);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_fields);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, strlen(post_fields));
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)strlen(post_fields));
 
     free_memory(&page);
     init_memory(&page);
@@ -411,17 +506,51 @@ static int login_with_acid(CURL *curl, const char *student_id, const char *passw
     }
 }
 
-int main() {
+int main(int argc, char **argv) {
+    int scheduled = argc > 1 && strcmp(argv[1], "--scheduled") == 0;
+
+    if (scheduled) {
+        HWND console = GetConsoleWindow();
+        if (console) ShowWindow(console, SW_HIDE);
+    }
+
     /* 解决中文乱码 */
     SetConsoleOutputCP(65001);
 
     char student_id[64];
     char password[128];
     char error_msg[512];
+    char ssid[DOT11_SSID_MAX_LENGTH + 1] = {0};
+
+    int ssid_result = get_target_ssid(ssid, sizeof(ssid));
+    if (ssid_result <= 0) {
+        if (!scheduled) {
+            printf(ssid_result == 0
+                       ? "当前未连接到 NEU、NEU-2.4G 或 NEU-mobile，无需登录。\n"
+                       : "无法读取当前 Wi-Fi，已跳过自动登录。\n");
+        }
+        pause_if_interactive(scheduled);
+        return ssid_result < 0 ? 2 : 0;
+    }
+
+    if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) {
+        printf("[错误] libcurl 全局初始化失败\n");
+        pause_if_interactive(scheduled);
+        return 1;
+    }
+
+    printf("已连接校园网 %s，正在检查互联网连接...\n", ssid);
+    if (internet_is_available()) {
+        printf("网络已经连通，无需重复登录。\n");
+        curl_global_cleanup();
+        pause_if_interactive(scheduled);
+        return 0;
+    }
 
     if (read_config(student_id, sizeof(student_id), password, sizeof(password)) != 0) {
         printf("[错误] 无法读取配置文件 config.ini\n");
-        system("pause");
+        curl_global_cleanup();
+        pause_if_interactive(scheduled);
         return 1;
     }
 
@@ -429,14 +558,15 @@ int main() {
     CURL *curl = curl_easy_init();
     if (!curl) {
         printf("[错误] libcurl 初始化失败\n");
-        system("pause");
+        curl_global_cleanup();
+        pause_if_interactive(scheduled);
         return 1;
     }
 
-    int acids[] = {15, 1};  /* 15=无线，1=有线 */
+    int acids[] = {15};  /* 三个目标 SSID 均为无线校园网 */
     int success = 0;
 
-    for (int i = 0; i < 2; i++) {
+    for (size_t i = 0; i < sizeof(acids) / sizeof(acids[0]); i++) {
         printf("正在尝试使用 acid=%d 登录...\n", acids[i]);
         if (login_with_acid(curl, student_id, password, acids[i], error_msg, sizeof(error_msg)) == 0) {
             printf("[成功] 登录成功！(acid=%d)\n", acids[i]);
@@ -452,6 +582,7 @@ int main() {
     }
 
     curl_easy_cleanup(curl);
-    system("pause");
+    curl_global_cleanup();
+    pause_if_interactive(scheduled);
     return success ? 0 : 1;
 }
