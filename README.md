@@ -29,12 +29,12 @@ powershell -ExecutionPolicy Bypass -File .\Uninstall-AutoLoginTask.ps1
 `Shortcuts.ahk` 是旧的定时轮询方案，安装上述计划任务后不要再运行它。
 
 ### 3. 环境要求
-Windows 10/11。编译需要 GCC、libcurl、OpenSSL 和 Windows WLAN API。
+运行只需要 Windows 10/11。编译需要 GCC、OpenSSL、WinHTTP 和 Windows WLAN API。
 
 ### 4. 编译
 
 ```powershell
-gcc -std=c17 -O2 AutoLogin.c -o AutoLogin.exe -lcurl -lcrypto -lwlanapi
+gcc -std=c17 -O2 AutoLogin.c -o AutoLogin.exe -lcrypto -lwinhttp -lwlanapi
 ```
 
 计划任务会使用 `--scheduled` 参数隐藏窗口；手动双击运行时仍会显示结果。

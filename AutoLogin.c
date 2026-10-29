@@ -4,9 +4,10 @@ author : Skowosy(ZHT0711)*/
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <windows.h>
+#include <winhttp.h>
 #include <wlanapi.h>
-#include <curl/curl.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <openssl/rsa.h>
@@ -35,28 +36,174 @@ static void init_memory(struct MemoryStruct *chunk) {
     if (chunk->memory) chunk->memory[0] = '\0';
 }
 
-/* libcurl写回调函数 */
-static size_t write_callback(void *contents, size_t size, size_t nmemb, void *userp) {
-    size_t realsize = size * nmemb;
-    struct MemoryStruct *mem = (struct MemoryStruct *)userp;
-    char *ptr = realloc(mem->memory, mem->size + realsize + 1);
-    if (!ptr) {
-        printf("内存不足!\n");
-        return 0;
-    }
-
-    mem->memory = ptr;
-    memcpy(&(mem->memory[mem->size]), contents, realsize);
-    mem->size += realsize;
-    mem->memory[mem->size] = 0;
-    return realsize;
-}
-
 /* 释放内存结构 */
 static void free_memory(struct MemoryStruct *chunk) {
     free(chunk->memory);
     chunk->memory = NULL;
     chunk->size = 0;
+}
+
+struct HttpResponse {
+    struct MemoryStruct body;
+    DWORD status_code;
+    DWORD win_error;
+    char location[2048];
+};
+
+static void init_http_response(struct HttpResponse *response) {
+    init_memory(&response->body);
+    response->status_code = 0;
+    response->win_error = ERROR_SUCCESS;
+    response->location[0] = '\0';
+}
+
+static void free_http_response(struct HttpResponse *response) {
+    free_memory(&response->body);
+}
+
+static int utf8_to_wide(const char *input, wchar_t *output, int output_count) {
+    return MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, input, -1,
+                               output, output_count) > 0;
+}
+
+static int query_location(HINTERNET request, char *output, size_t output_size) {
+    wchar_t location[2048];
+    DWORD location_bytes = sizeof(location);
+
+    if (!WinHttpQueryHeaders(request, WINHTTP_QUERY_LOCATION,
+                             WINHTTP_HEADER_NAME_BY_INDEX, location,
+                             &location_bytes, WINHTTP_NO_HEADER_INDEX)) {
+        return 0;
+    }
+
+    return WideCharToMultiByte(CP_UTF8, 0, location, -1, output,
+                               (int)output_size, NULL, NULL) > 0;
+}
+
+static int read_response_body(HINTERNET request, struct MemoryStruct *body) {
+    const size_t max_response_size = 2 * 1024 * 1024;
+
+    for (;;) {
+        DWORD available = 0;
+        DWORD bytes_read = 0;
+        if (!WinHttpQueryDataAvailable(request, &available)) return 0;
+        if (available == 0) return 1;
+        if (body->size + available > max_response_size) return 0;
+
+        char *new_memory = realloc(body->memory, body->size + available + 1);
+        if (!new_memory) return 0;
+        body->memory = new_memory;
+
+        if (!WinHttpReadData(request, body->memory + body->size,
+                             available, &bytes_read)) {
+            return 0;
+        }
+        body->size += bytes_read;
+        body->memory[body->size] = '\0';
+    }
+}
+
+static int http_request(HINTERNET session, const wchar_t *method, const char *url,
+                        const wchar_t *headers, const void *request_body,
+                        DWORD request_size, int disable_redirects,
+                        struct HttpResponse *response) {
+    wchar_t wide_url[4096];
+    wchar_t host[256];
+    wchar_t path[3072];
+    wchar_t extra[1024];
+    wchar_t object_name[4096];
+    URL_COMPONENTS parts;
+    HINTERNET connection = NULL;
+    HINTERNET request = NULL;
+    int success = 0;
+
+    init_http_response(response);
+    if (!response->body.memory || !utf8_to_wide(url, wide_url, ARRAYSIZE(wide_url))) {
+        response->win_error = ERROR_INVALID_PARAMETER;
+        return 0;
+    }
+
+    memset(&parts, 0, sizeof(parts));
+    parts.dwStructSize = sizeof(parts);
+    parts.lpszHostName = host;
+    parts.dwHostNameLength = ARRAYSIZE(host) - 1;
+    parts.lpszUrlPath = path;
+    parts.dwUrlPathLength = ARRAYSIZE(path) - 1;
+    parts.lpszExtraInfo = extra;
+    parts.dwExtraInfoLength = ARRAYSIZE(extra) - 1;
+    if (!WinHttpCrackUrl(wide_url, 0, 0, &parts)) {
+        response->win_error = GetLastError();
+        return 0;
+    }
+    host[parts.dwHostNameLength] = L'\0';
+    path[parts.dwUrlPathLength] = L'\0';
+    extra[parts.dwExtraInfoLength] = L'\0';
+    if (swprintf(object_name, ARRAYSIZE(object_name), L"%ls%ls", path, extra) < 0) {
+        response->win_error = ERROR_INSUFFICIENT_BUFFER;
+        return 0;
+    }
+
+    connection = WinHttpConnect(session, host, parts.nPort, 0);
+    if (!connection) goto cleanup;
+
+    DWORD flags = parts.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0;
+    request = WinHttpOpenRequest(connection, method, object_name, NULL,
+                                 WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+    if (!request) goto cleanup;
+
+    if (disable_redirects) {
+        DWORD disabled_features = WINHTTP_DISABLE_REDIRECTS;
+        if (!WinHttpSetOption(request, WINHTTP_OPTION_DISABLE_FEATURE,
+                              &disabled_features, sizeof(disabled_features))) {
+            goto cleanup;
+        }
+    }
+
+    DWORD header_length = headers ? (DWORD)-1L : 0;
+    if (!WinHttpSendRequest(request, headers, header_length,
+                            (LPVOID)request_body, request_size, request_size, 0) ||
+        !WinHttpReceiveResponse(request, NULL)) {
+        goto cleanup;
+    }
+
+    DWORD status_size = sizeof(response->status_code);
+    if (!WinHttpQueryHeaders(request,
+                             WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                             WINHTTP_HEADER_NAME_BY_INDEX, &response->status_code,
+                             &status_size, WINHTTP_NO_HEADER_INDEX)) {
+        goto cleanup;
+    }
+
+    query_location(request, response->location, sizeof(response->location));
+    if (!read_response_body(request, &response->body)) goto cleanup;
+    success = 1;
+
+cleanup:
+    if (!success) response->win_error = GetLastError();
+    if (request) WinHttpCloseHandle(request);
+    if (connection) WinHttpCloseHandle(connection);
+    return success;
+}
+
+static char *url_encode(const char *input) {
+    static const char hex[] = "0123456789ABCDEF";
+    size_t input_len = strlen(input);
+    char *output = malloc(input_len * 3 + 1);
+    char *cursor = output;
+    if (!output) return NULL;
+
+    for (size_t i = 0; i < input_len; i++) {
+        unsigned char ch = (unsigned char)input[i];
+        if (isalnum(ch) || ch == '-' || ch == '_' || ch == '.' || ch == '~') {
+            *cursor++ = (char)ch;
+        } else {
+            *cursor++ = '%';
+            *cursor++ = hex[ch >> 4];
+            *cursor++ = hex[ch & 0x0F];
+        }
+    }
+    *cursor = '\0';
+    return output;
 }
 
 static int is_target_ssid(const DOT11_SSID *ssid) {
@@ -119,27 +266,22 @@ static int get_target_ssid(char *ssid_text, size_t text_size) {
 
 /* 只发一个短超时的 HTTPS HEAD 请求，避免已经联网时重复认证。 */
 static int internet_is_available(void) {
-    CURL *curl = curl_easy_init();
-    CURLcode result;
-    long status_code = 0;
+    HINTERNET session = WinHttpOpen(L"Mozilla/5.0 NEU-AutoLogin/1.0",
+                                    WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                                    WINHTTP_NO_PROXY_NAME,
+                                    WINHTTP_NO_PROXY_BYPASS, 0);
+    struct HttpResponse response;
+    int available = 0;
 
-    if (!curl) return 0;
-    curl_easy_setopt(curl, CURLOPT_URL, CONNECTIVITY_URL);
-    curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 3L);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 3000L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 5000L);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "Mozilla/5.0 NEU-AutoLogin/1.0");
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
-
-    result = curl_easy_perform(curl);
-    if (result == CURLE_OK) {
-        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status_code);
+    if (!session) return 0;
+    WinHttpSetTimeouts(session, 3000, 3000, 3000, 5000);
+    if (http_request(session, L"HEAD", CONNECTIVITY_URL, NULL, NULL, 0, 0,
+                     &response)) {
+        available = response.status_code >= 200 && response.status_code < 400;
     }
-    curl_easy_cleanup(curl);
-    return result == CURLE_OK && status_code >= 200 && status_code < 400;
+    free_http_response(&response);
+    WinHttpCloseHandle(session);
+    return available;
 }
 
 static void pause_if_interactive(int scheduled) {
@@ -316,194 +458,147 @@ static int read_config(char *student_id, size_t id_size, char *password, size_t 
     return 0;
 }
 
-/* 执行一次带有给定acid的登录尝试 */
-static int login_with_acid(CURL *curl, const char *student_id, const char *password,
-                           int acid, char *error_msg, size_t err_size) {
-    CURLcode res;
+/* 执行一次带有给定 acid 的登录尝试。会话由 WinHTTP 管理 Cookie。 */
+static int login_with_acid(HINTERNET session, const char *student_id,
+                           const char *password, int acid,
+                           char *error_msg, size_t err_size) {
     char url[256];
-    struct MemoryStruct page;
-    char *lt = NULL, *execution = NULL;
-    long status_code = 0;
+    char rsa[512];
+    char post_fields[1536];
+    char sso_url[2048];
+    char *lt = NULL;
+    char *execution = NULL;
+    char *rsa_encoded = NULL;
+    char *lt_encoded = NULL;
+    char *execution_encoded = NULL;
+    struct HttpResponse page;
+    struct HttpResponse response;
+    int page_initialized = 0;
+    int response_initialized = 0;
+    int result = -1;
 
     snprintf(url, sizeof(url),
              "https://pass.neu.edu.cn/tpass/login?service=http://ipgw.neu.edu.cn/srun_portal_sso?ac_id=%d",
              acid);
 
-    init_memory(&page);
-
-    /* 设置通用选项 */
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&page);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT,
-                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                     "AppleWebKit/537.36 Chrome/120 Safari/537.36");
-    curl_easy_setopt(curl, CURLOPT_COOKIEFILE, "");
-    curl_easy_setopt(curl, CURLOPT_COOKIEJAR, "");
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
-
-    /* 1. 获取登录页面 */
-    curl_easy_setopt(curl, CURLOPT_URL, url);
-    curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
-
-    res = curl_easy_perform(curl);
-    if (res != CURLE_OK) {
-        snprintf(error_msg, err_size, "访问pass.neu.edu.cn失败: %s", curl_easy_strerror(res));
-        free_memory(&page);
-        return -1;
+    /* 1. 获取登录页，同时建立认证 Cookie。 */
+    if (!http_request(session, L"GET", url, NULL, NULL, 0, 1, &page)) {
+        page_initialized = 1;
+        snprintf(error_msg, err_size, "访问pass.neu.edu.cn失败，WinHTTP错误: %lu",
+                 (unsigned long)page.win_error);
+        goto cleanup;
+    }
+    page_initialized = 1;
+    if (page.status_code != 200) {
+        snprintf(error_msg, err_size, "访问pass.neu.edu.cn失败，状态码: %lu",
+                 (unsigned long)page.status_code);
+        goto cleanup;
     }
 
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status_code);
-    if (status_code != 200) {
-        snprintf(error_msg, err_size, "访问pass.neu.edu.cn失败，状态码: %ld", status_code);
-        free_memory(&page);
-        return -1;
+    /* 2. 访问 checkacid 更新网关会话。 */
+    if (!http_request(session, L"GET", "https://ipgw.neu.edu.cn/checkacid",
+                      NULL, NULL, 0, 1, &response)) {
+        response_initialized = 1;
+        snprintf(error_msg, err_size, "访问checkacid失败，WinHTTP错误: %lu",
+                 (unsigned long)response.win_error);
+        goto cleanup;
     }
+    response_initialized = 1;
+    free_http_response(&response);
+    response_initialized = 0;
 
-    /* 2. 访问 checkacid 更新会话 */
-    {
-        struct MemoryStruct check_page;
-        init_memory(&check_page);
-        curl_easy_setopt(curl, CURLOPT_URL, "https://ipgw.neu.edu.cn/checkacid");
-        curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&check_page);
-        res = curl_easy_perform(curl);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&page);
-        if (res != CURLE_OK) {
-            snprintf(error_msg, err_size, "访问checkacid失败: %s", curl_easy_strerror(res));
-            free_memory(&check_page);
-            free_memory(&page);
-            return -1;
-        }
-        free_memory(&check_page);
-    }
-
-    /* 提取 lt 和 execution */
-    lt = extract_lt(page.memory);
-    execution = extract_execution(page.memory);
+    lt = extract_lt(page.body.memory);
+    execution = extract_execution(page.body.memory);
     if (!lt || !execution) {
         snprintf(error_msg, err_size, "无法从登录页面提取lt或execution");
-        if (lt) free(lt);
-        if (execution) free(execution);
-        free_memory(&page);
-        return -1;
+        goto cleanup;
     }
 
-    /* 构造 POST 数据：新版登录页要求 RSA 加密，并对表单值进行 URL 编码 */
-    char rsa[512];
     if (encrypt_credentials(student_id, password, rsa, sizeof(rsa)) != 0) {
         snprintf(error_msg, err_size, "RSA加密账号密码失败");
-        free(lt);
-        free(execution);
-        free_memory(&page);
-        return -1;
+        goto cleanup;
     }
-    int ul = strlen(student_id);
-    int pl = strlen(password);
 
-    char *rsa_encoded = curl_easy_escape(curl, rsa, 0);
-    char *lt_encoded = curl_easy_escape(curl, lt, 0);
-    char *execution_encoded = curl_easy_escape(curl, execution, 0);
+    rsa_encoded = url_encode(rsa);
+    lt_encoded = url_encode(lt);
+    execution_encoded = url_encode(execution);
     if (!rsa_encoded || !lt_encoded || !execution_encoded) {
         snprintf(error_msg, err_size, "URL编码登录表单失败");
-        curl_free(rsa_encoded);
-        curl_free(lt_encoded);
-        curl_free(execution_encoded);
-        free(lt);
-        free(execution);
-        free_memory(&page);
-        return -1;
+        goto cleanup;
     }
 
-    char post_fields[1536];
-    snprintf(post_fields, sizeof(post_fields),
-             "rsa=%s&ul=%d&pl=%d&lt=%s&execution=%s&_eventId=submit",
-             rsa_encoded, ul, pl, lt_encoded, execution_encoded);
-    curl_free(rsa_encoded);
-    curl_free(lt_encoded);
-    curl_free(execution_encoded);
-
-    /* 3. 提交登录表单 */
-    curl_easy_setopt(curl, CURLOPT_URL, url);
-    curl_easy_setopt(curl, CURLOPT_POST, 1L);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_fields);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)strlen(post_fields));
-
-    free_memory(&page);
-    init_memory(&page);
-
-    res = curl_easy_perform(curl);
-    if (res != CURLE_OK) {
-        snprintf(error_msg, err_size, "提交登录表单失败: %s", curl_easy_strerror(res));
-        free(lt);
-        free(execution);
-        free_memory(&page);
-        return -1;
+    int post_length = snprintf(
+        post_fields, sizeof(post_fields),
+        "rsa=%s&ul=%zu&pl=%zu&lt=%s&execution=%s&_eventId=submit",
+        rsa_encoded, strlen(student_id), strlen(password), lt_encoded,
+        execution_encoded);
+    if (post_length < 0 || (size_t)post_length >= sizeof(post_fields)) {
+        snprintf(error_msg, err_size, "登录表单过长");
+        goto cleanup;
     }
 
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status_code);
-    if (status_code != 302) {
-        snprintf(error_msg, err_size, "登录响应状态码不是302，而是: %ld", status_code);
-        free(lt);
-        free(execution);
-        free_memory(&page);
-        return -1;
+    /* 3. 提交登录表单，保留 302 的 Location。 */
+    if (!http_request(session, L"POST", url,
+                      L"Content-Type: application/x-www-form-urlencoded\r\n",
+                      post_fields, (DWORD)post_length, 1, &response)) {
+        response_initialized = 1;
+        snprintf(error_msg, err_size, "提交登录表单失败，WinHTTP错误: %lu",
+                 (unsigned long)response.win_error);
+        goto cleanup;
     }
-
-    /* 获取重定向URL */
-    char *location = NULL;
-    curl_easy_getinfo(curl, CURLINFO_REDIRECT_URL, &location);
-    if (!location) {
+    response_initialized = 1;
+    if (response.status_code != 302) {
+        snprintf(error_msg, err_size, "登录响应状态码不是302，而是: %lu",
+                 (unsigned long)response.status_code);
+        goto cleanup;
+    }
+    if (response.location[0] == '\0') {
         snprintf(error_msg, err_size, "未获取到重定向URL");
-        free(lt);
-        free(execution);
-        free_memory(&page);
-        return -1;
+        goto cleanup;
     }
 
-    /* 构造SSO链接 */
-    char sso_url[512];
     const char *prefix = "http://ipgw.neu.edu.cn/";
     const char *v1 = "http://ipgw.neu.edu.cn/v1/";
-    if (strncmp(location, prefix, strlen(prefix)) == 0) {
-        snprintf(sso_url, sizeof(sso_url), "%s%s", v1, location + strlen(prefix));
+    int sso_length;
+    if (strncmp(response.location, prefix, strlen(prefix)) == 0) {
+        sso_length = snprintf(sso_url, sizeof(sso_url), "%s%s", v1,
+                              response.location + strlen(prefix));
     } else {
-        strncpy(sso_url, location, sizeof(sso_url) - 1);
-        sso_url[sizeof(sso_url) - 1] = '\0';
+        sso_length = snprintf(sso_url, sizeof(sso_url), "%s", response.location);
     }
-
-    /* 4. 访问SSO链接完成登录 */
-    curl_easy_setopt(curl, CURLOPT_URL, sso_url);
-    curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
-
-    free_memory(&page);
-    init_memory(&page);
-
-    res = curl_easy_perform(curl);
-    if (res != CURLE_OK) {
-        snprintf(error_msg, err_size, "SSO登录请求失败: %s", curl_easy_strerror(res));
-        free(lt);
-        free(execution);
-        free_memory(&page);
-        return -1;
+    if (sso_length < 0 || (size_t)sso_length >= sizeof(sso_url)) {
+        snprintf(error_msg, err_size, "重定向URL过长");
+        goto cleanup;
     }
+    free_http_response(&response);
+    response_initialized = 0;
 
-    /* 正常登录成功，或当前 IP 已在线，都视为成功 */
-    if (strstr(page.memory, "success") != NULL ||
-        strstr(page.memory, "\"code\":0") != NULL ||
-        strstr(page.memory, "ip_already_online_error") != NULL) {
-        free(lt);
-        free(execution);
-        free_memory(&page);
-        return 0;  /* 成功 */
+    /* 4. 访问 SSO 链接完成登录。 */
+    if (!http_request(session, L"GET", sso_url, NULL, NULL, 0, 0, &response)) {
+        response_initialized = 1;
+        snprintf(error_msg, err_size, "SSO登录请求失败，WinHTTP错误: %lu",
+                 (unsigned long)response.win_error);
+        goto cleanup;
+    }
+    response_initialized = 1;
+
+    if (strstr(response.body.memory, "success") != NULL ||
+        strstr(response.body.memory, "\"code\":0") != NULL ||
+        strstr(response.body.memory, "ip_already_online_error") != NULL) {
+        result = 0;
     } else {
-        snprintf(error_msg, err_size, "SSO登录返回: %s", page.memory);
-        free(lt);
-        free(execution);
-        free_memory(&page);
-        return -1;
+        snprintf(error_msg, err_size, "SSO登录返回: %.440s", response.body.memory);
     }
+
+cleanup:
+    free(rsa_encoded);
+    free(lt_encoded);
+    free(execution_encoded);
+    free(lt);
+    free(execution);
+    if (response_initialized) free_http_response(&response);
+    if (page_initialized) free_http_response(&page);
+    return result;
 }
 
 int main(int argc, char **argv) {
@@ -533,42 +628,37 @@ int main(int argc, char **argv) {
         return ssid_result < 0 ? 2 : 0;
     }
 
-    if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) {
-        printf("[错误] libcurl 全局初始化失败\n");
-        pause_if_interactive(scheduled);
-        return 1;
-    }
-
     printf("已连接校园网 %s，正在检查互联网连接...\n", ssid);
     if (internet_is_available()) {
         printf("网络已经连通，无需重复登录。\n");
-        curl_global_cleanup();
         pause_if_interactive(scheduled);
         return 0;
     }
 
     if (read_config(student_id, sizeof(student_id), password, sizeof(password)) != 0) {
         printf("[错误] 无法读取配置文件 config.ini\n");
-        curl_global_cleanup();
         pause_if_interactive(scheduled);
         return 1;
     }
 
-    /* 初始化 libcurl */
-    CURL *curl = curl_easy_init();
-    if (!curl) {
-        printf("[错误] libcurl 初始化失败\n");
-        curl_global_cleanup();
+    HINTERNET session = WinHttpOpen(
+        L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) NEU-AutoLogin/1.0",
+        WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME,
+        WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!session) {
+        printf("[错误] WinHTTP 初始化失败: %lu\n", (unsigned long)GetLastError());
         pause_if_interactive(scheduled);
         return 1;
     }
+    WinHttpSetTimeouts(session, 5000, 5000, 10000, 10000);
 
     int acids[] = {15};  /* 三个目标 SSID 均为无线校园网 */
     int success = 0;
 
     for (size_t i = 0; i < sizeof(acids) / sizeof(acids[0]); i++) {
         printf("正在尝试使用 acid=%d 登录...\n", acids[i]);
-        if (login_with_acid(curl, student_id, password, acids[i], error_msg, sizeof(error_msg)) == 0) {
+        if (login_with_acid(session, student_id, password, acids[i],
+                            error_msg, sizeof(error_msg)) == 0) {
             printf("[成功] 登录成功！(acid=%d)\n", acids[i]);
             success = 1;
             break;
@@ -581,8 +671,7 @@ int main(int argc, char **argv) {
         printf("[结果] 所有登录尝试均失败，请检查账号密码或网络。\n");
     }
 
-    curl_easy_cleanup(curl);
-    curl_global_cleanup();
+    WinHttpCloseHandle(session);
     pause_if_interactive(scheduled);
     return success ? 0 : 1;
 }
